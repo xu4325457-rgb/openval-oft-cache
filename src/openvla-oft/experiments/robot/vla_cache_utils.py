@@ -19,10 +19,11 @@ def get_layer_mask_schedule(multihead_attention, apply_weighted_growth=True, gro
     Returns:
         torch.Tensor: Layer-wise reuse proportions, shape (num_layers - 1,).
     """
-    device = multihead_attention[0].device
+    attention_layers = [attn for attn in multihead_attention if isinstance(attn, torch.Tensor) and attn.ndim == 4]
+    device = attention_layers[0].device
     entropies = []
     
-    for attn in multihead_attention[:-1]:
+    for attn in attention_layers:
         attn = attn.mean(dim=1)[0]
         attn /= attn.sum(dim=-1, keepdim=True) + 1e-10
         attn = torch.nan_to_num(attn, nan=0.0)
@@ -96,17 +97,18 @@ def token_attention_merge(multihead_attention, layer_id=15, primary=True):
     """
     Computes mean attention from text tokens to vision tokens.
     """
-    attn_map = multihead_attention[layer_id].to(torch.float32).squeeze(0).mean(dim=0)
+    attention_layers = [attn for attn in multihead_attention if isinstance(attn, torch.Tensor) and attn.ndim == 4]
+    layer_id = min(layer_id, len(attention_layers) - 1)
+    attn_map = attention_layers[layer_id].to(torch.float32).squeeze(0).mean(dim=0)
 
     v_token_start = 1 if primary else 257
     v_token_end = v_token_start + 256
     t_token_start = 513
-    t_token_end = t_token_start + 34
+    t_token_end = min(t_token_start + 34, attn_map.shape[0])
+    if t_token_start >= attn_map.shape[0]:
+        t_token_start = max(0, attn_map.shape[0] - 34)
 
-    attention_pos = multihead_attention[-1]
-    text_mask = (attention_pos >= t_token_start) & (attention_pos < t_token_end)
-
-    relation = attn_map[text_mask, v_token_start:v_token_end]
+    relation = attn_map[t_token_start:t_token_end, v_token_start:v_token_end]
     return relation.mean(dim=0).cpu()
 
 def get_top_attention_patches(attn_scores, top_k=120):
