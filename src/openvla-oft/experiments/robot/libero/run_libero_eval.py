@@ -7,6 +7,7 @@ Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 import json
 import logging
 import os
+import re
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -123,6 +124,11 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    resume_log_path: Optional[str] = None            # Existing eval log to resume from; parses completed episodes/successes
+    resume_task_id: int = 0                          # Task id to start from when resuming manually
+    resume_episode_idx: int = 0                      # Episode index within resume_task_id to start from when resuming manually
+    resume_total_episodes: int = 0                   # Completed episodes before this run when resuming manually
+    resume_total_successes: int = 0                  # Completed successes before this run when resuming manually
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -144,6 +150,13 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+    assert cfg.resume_task_id >= 0, "resume_task_id must be non-negative"
+    assert cfg.resume_episode_idx >= 0, "resume_episode_idx must be non-negative"
+    assert cfg.resume_total_episodes >= 0, "resume_total_episodes must be non-negative"
+    assert cfg.resume_total_successes >= 0, "resume_total_successes must be non-negative"
+    assert cfg.resume_total_successes <= cfg.resume_total_episodes, (
+        "resume_total_successes cannot exceed resume_total_episodes"
+    )
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -225,6 +238,40 @@ def log_message(message: str, log_file=None):
     if log_file:
         log_file.write(message + "\n")
         log_file.flush()
+
+
+def parse_resume_log(cfg: GenerateConfig, num_tasks: int):
+    """Parse a previous local eval log and derive where to resume."""
+    if cfg.resume_log_path is None:
+        return (
+            cfg.resume_task_id,
+            cfg.resume_episode_idx,
+            cfg.resume_total_episodes,
+            cfg.resume_total_successes,
+            [],
+        )
+
+    with open(cfg.resume_log_path, "r") as f:
+        log_text = f.read()
+
+    success_history = [match == "True" for match in re.findall(r"^Success: (True|False)$", log_text, re.MULTILINE)]
+    if not success_history:
+        raise ValueError(f"No completed episodes found in resume log: {cfg.resume_log_path}")
+
+    completed_episodes = len(success_history)
+    completed_successes = sum(success_history)
+    max_episodes = num_tasks * cfg.num_trials_per_task
+    if completed_episodes > max_episodes:
+        raise ValueError(
+            f"Resume log has {completed_episodes} completed episodes, but this config expects at most {max_episodes}"
+        )
+
+    resume_task_id = completed_episodes // cfg.num_trials_per_task
+    resume_episode_idx = completed_episodes % cfg.num_trials_per_task
+    if resume_task_id >= num_tasks and resume_episode_idx == 0:
+        resume_task_id = num_tasks
+
+    return resume_task_id, resume_episode_idx, completed_episodes, completed_successes, success_history
 
 
 def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=None):
@@ -413,6 +460,8 @@ def run_task(
     noisy_action_projector=None,
     total_episodes=0,
     total_successes=0,
+    start_episode_idx=0,
+    initial_task_successes=0,
     log_file=None,
 ):
     """Run evaluation for a single task."""
@@ -426,13 +475,20 @@ def run_task(
     env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
 
     # Start episodes
-    task_episodes, task_successes = 0, 0
+    task_episodes, task_successes = start_episode_idx, initial_task_successes
     total_steps = 0
     total_time = 0
     total_task_static_tokens_primary = 0
     total_task_static_tokens_wrist = 0
     
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+    if start_episode_idx > 0:
+        log_message(
+            f"Resuming task {task_id} from episode_idx={start_episode_idx}; "
+            f"previous task successes={initial_task_successes}/{start_episode_idx}",
+            log_file,
+        )
+
+    for episode_idx in tqdm.tqdm(range(start_episode_idx, cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
 
         # Handle initial state
@@ -452,7 +508,7 @@ def run_task(
             # Get initial state
             initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
-        log_message(f"Starting episode {task_episodes + 1}...", log_file)
+        log_message(f"Starting episode {episode_idx + 1}...", log_file)
 
         # Run episode
         success, replay_images, replay_images_wrist, eposode_metrics = run_episode(
@@ -543,8 +599,23 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
     # Start evaluation
-    total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    resume_task_id, resume_episode_idx, total_episodes, total_successes, success_history = parse_resume_log(cfg, num_tasks)
+    if resume_task_id > 0 or resume_episode_idx > 0 or total_episodes > 0:
+        log_message(
+            f"Resuming evaluation from task_id={resume_task_id}, episode_idx={resume_episode_idx}; "
+            f"completed episodes={total_episodes}, successes={total_successes}",
+            log_file,
+        )
+
+    if resume_task_id >= num_tasks:
+        log_message("Resume log already contains all configured episodes; nothing to run.", log_file)
+
+    for task_id in tqdm.tqdm(range(resume_task_id, num_tasks)):
+        start_episode_idx = resume_episode_idx if task_id == resume_task_id else 0
+        task_history_start = task_id * cfg.num_trials_per_task
+        task_history_end = task_history_start + start_episode_idx
+        initial_task_successes = sum(success_history[task_history_start:task_history_end])
+
         total_episodes, total_successes = run_task(
             cfg,
             task_suite,
@@ -557,6 +628,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             noisy_action_projector,
             total_episodes,
             total_successes,
+            start_episode_idx,
+            initial_task_successes,
             log_file,
         )
     
