@@ -6,6 +6,17 @@ from PIL import Image, ImageDraw
 from skimage.util import view_as_blocks
 
 
+def split_attention_layers_and_positions(multihead_attention):
+    attention_layers = [attn for attn in multihead_attention if isinstance(attn, torch.Tensor) and attn.ndim == 4]
+    position_tensors = [
+        attn.flatten()
+        for attn in multihead_attention
+        if isinstance(attn, torch.Tensor) and attn.ndim <= 2 and attn.numel() > 0
+    ]
+    cache_position = position_tensors[-1] if position_tensors else None
+    return attention_layers, cache_position
+
+
 @torch.no_grad()
 def get_layer_mask_schedule(multihead_attention, apply_weighted_growth=True, growth_factor=0.55):
     """
@@ -19,7 +30,7 @@ def get_layer_mask_schedule(multihead_attention, apply_weighted_growth=True, gro
     Returns:
         torch.Tensor: Layer-wise reuse proportions, shape (num_layers - 1,).
     """
-    attention_layers = [attn for attn in multihead_attention if isinstance(attn, torch.Tensor) and attn.ndim == 4]
+    attention_layers, _ = split_attention_layers_and_positions(multihead_attention)
     device = attention_layers[0].device
     entropies = []
     
@@ -97,18 +108,22 @@ def token_attention_merge(multihead_attention, layer_id=15, primary=True):
     """
     Computes mean attention from text tokens to vision tokens.
     """
-    attention_layers = [attn for attn in multihead_attention if isinstance(attn, torch.Tensor) and attn.ndim == 4]
+    attention_layers, cache_position = split_attention_layers_and_positions(multihead_attention)
     layer_id = min(layer_id, len(attention_layers) - 1)
     attn_map = attention_layers[layer_id].to(torch.float32).squeeze(0).mean(dim=0)
 
     v_token_start = 1 if primary else 257
     v_token_end = v_token_start + 256
     t_token_start = 513
-    t_token_end = min(t_token_start + 34, attn_map.shape[0])
-    if t_token_start >= attn_map.shape[0]:
-        t_token_start = max(0, attn_map.shape[0] - 34)
-
-    relation = attn_map[t_token_start:t_token_end, v_token_start:v_token_end]
+    if cache_position is not None and cache_position.numel() == attn_map.shape[0]:
+        cache_position = cache_position.to(attn_map.device)
+        text_mask = (cache_position >= t_token_start) & (cache_position < t_token_start + 34)
+        relation = attn_map[text_mask, v_token_start:v_token_end]
+    else:
+        t_token_end = min(t_token_start + 34, attn_map.shape[0])
+        if t_token_start >= attn_map.shape[0]:
+            t_token_start = max(0, attn_map.shape[0] - 34)
+        relation = attn_map[t_token_start:t_token_end, v_token_start:v_token_end]
     return relation.mean(dim=0).cpu()
 
 def get_top_attention_patches(attn_scores, top_k=120):
